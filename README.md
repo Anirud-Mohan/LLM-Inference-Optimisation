@@ -1,116 +1,134 @@
 # LLM Inference Optimization from Scratch
 
-A comprehensive exploration of modern inference optimization techniques for Large Language Models, implemented from first principles using PyTorch.
-
-##  Project Overview
-
-This repository demonstrates 7 critical optimization techniques that power production LLM systems like GPT, Llama, and Mistral. Each phase builds upon the previous one, progressively reducing latency and memory footprint while maintaining model quality.
-
-**Status:**  Work in Progress (Phases 1-5 complete, 6-7 coming soon)
+A ground-up exploration of the optimization techniques that power production LLM inference systems, implemented from first principles in PyTorch — then deployed to real hardware to verify that the concepts hold under production load.
 
 ---
 
-## 📚 Optimization Phases
+## Philosophy
 
-### ✅ Phase 1: KV Caching
+Most LLM inference content either stops at theory or jumps straight to "just use vLLM". This project takes a third path: **understand every technique by building it from scratch, then deploy it and measure the results against real-world targets**.
+
+The notebook (`LLM_inference_from_scratch.ipynb`) builds each optimization layer by layer, from a naive attention loop up to paged memory management. The deployment project (`llm-qwen-deployment/`) takes those same techniques — KV caching, dynamic batching, INT4 quantization — wraps them in a production FastAPI server, and runs a 1-hour load test against a real throughput target (>10,000 requests/hr).
+
+The gap between "I understand how batching works" and "I can build a server that serves 13,000 requests in an hour" is what this project tries to close.
+
+---
+
+## Repository Structure
+
+```
+LLM-Inference-Optimisation/
+├── LLM_inference_from_scratch.ipynb   # Optimization phases 1–7 (theory + benchmarks)
+└── llm-qwen-deployment/               # Production deployment project
+    ├── custom_server.py               # FastAPI server: dynamic batching + INT4 quantization
+    ├── locustfile.py                  # Load test client (100 users, 2 pods)
+    ├── llm_as_eval.py                 # LLM-as-a-judge quality evaluation
+    ├── generate_prompts.py            # 1,500 synthetic story prompts
+    └── results/                       # All benchmark CSVs and eval scores
+```
+
+---
+
+## Optimization Phases (Notebook)
+
+### Phase 1 — KV Caching
 **The foundation of efficient autoregressive decoding**
 
 - Implements single-head and multi-layer attention with KV cache support
-- Compares naive recomputation vs. cached approach across different sequence lengths
+- Compares naive recomputation vs. cached approach across sequence lengths
 - **Key Result:** Up to **10x speedup** for long sequences by avoiding redundant key/value computations
 
-### ✅ Phase 2: Peak GPU Utilization through Batching
+### Phase 2 — Peak GPU Utilization through Batching
 **Maximizing hardware throughput**
 
 - Explores batch scaling to saturate GPU compute (targeting peak FLOPS)
-- Benchmarks both custom models and GPT-2 with varying batch sizes
+- Benchmarks custom models and GPT-2 with varying batch sizes
 - **Key Insight:** Batch processing amortizes memory bandwidth costs and dramatically improves tokens/sec
 
-### ✅ Phase 3: Sliding Window Attention
-**Memory-bounded long context handling**
+### Phase 3 — Sliding Window Attention
+**Memory-bounded long-context handling**
 
 - Implements attention with configurable window sizes (32, 64, 128, 256 tokens)
 - Analyzes memory/speed trade-offs as sequence length grows
-- **Key Trade-off:** Constant O(window_size) memory for KV cache vs. loss of long-range dependencies
+- **Key Trade-off:** O(window_size) memory for KV cache vs. loss of long-range dependencies
 
-### ✅ Phase 4: Flash Attention
+### Phase 4 — Flash Attention
 **Kernel-level memory optimization**
 
 - Integrates PyTorch's `scaled_dot_product_attention` with Flash/memory-efficient backends
 - Compares FP32 naive attention vs. FP16 fused kernels
-- **Hardware Note:** Demonstrates memory-efficient attention on Turing GPUs (T4); Flash Attention v2 requires Ampere+ (A100, RTX 3090)
-- **Why both Phase 3 & 4?** Sliding window caps *context length*; Flash optimizes *computation* — orthogonal optimizations used together in production
+- **Hardware Note:** Memory-efficient attention on Turing GPUs (T4); Flash Attention v2 requires Ampere+ (A100, RTX 3090)
+- **Why both Phase 3 & 4?** Sliding window caps *context length*; Flash Attention optimizes *computation* — orthogonal optimizations used together in production
 
-### ✅ Phase 5: Paged Attention (vLLM-style)
+### Phase 5 — Paged Attention (vLLM-style)
 **Dynamic memory allocation for batched inference**
 
 - Custom block-based KV cache with fixed-size pages
 - Enables memory sharing and reuse across sequences (prefix sharing, beam search)
 - **Key Result:** ~4x memory savings vs. naive per-sequence allocation for variable-length batches
 
-### 🔜 Phase 6: Speculative Decoding
+### Phase 6 — Speculative Decoding
 **Latency reduction via draft models**
 
-Coming soon: Using small draft models to predict multiple tokens, verified by the target model in parallel.
+Empirically evaluated and rejected for this use case (see [llm-qwen-deployment/README.md](llm-qwen-deployment/README.md) — "Why Batching Over Speculative Decoding"). HuggingFace's `generate()` enforces `batch_size=1` for speculative decoding, making it incompatible with batched serving. Dynamic batching with BS=8 delivered a **3.7× latency improvement** over speculative decoding at batch=1.
 
-### 🔜 Phase 7: Production Deployment
-**End-to-end serving pipeline**
+### Phase 7 — Production Deployment
+**End-to-end serving pipeline — complete**
 
-Coming soon: Model quantization, continuous batching, and deployment with inference frameworks (vLLM/TGI/TensorRT-LLM).
+Applied KV caching (Phase 1), dynamic batching (Phase 2), and INT4 quantization to build a FastAPI inference server deployed across 2 RunPod GPU pods. See `llm-qwen-deployment/` for the full implementation and results.
 
----
-
-## 🛠️ Technical Stack
-
-- **Framework:** PyTorch 2.x with CUDA support
-- **Models:** Custom transformer blocks, HuggingFace GPT-2
-- **Hardware:** NVIDIA GPUs (tested on T4; Ampere+ recommended for full Flash Attention support)
-- **Visualization:** Matplotlib for performance analysis
+**Production result: 13,041 requests served in one hour — 130% of the 10,000 req/hr target.**
 
 ---
 
-## 🎯 Learning Outcomes
+## Production Deployment Results
 
-By working through this notebook, you will understand:
+| Stage | Config | Throughput | Median Latency | P95 Latency |
+|---|---|---|---|---|
+| Smoke test: spec. decoding | BS=1, 10 users | ~324 req/hr | 100 s | 120 s |
+| Smoke test: dynamic batching | BS=8, 10 users | ~1,440 req/hr | 27 s | 32 s |
+| Production run 1 | BS=8, 20 users, 1 hr | 4,090 req/hr | 37.6 s | 75.9 s |
+| **Production run 2** | **BS=64, 100 users, 1 hr** | **13,041 req/hr** | **27.6 s** | **29.6 s** |
 
-1. **Why KV caching is mandatory** for any production LLM inference system
-2. **How batching exploits GPU parallelism** to maximize throughput
-3. **The memory/context trade-off** in windowed attention mechanisms
-4. **Kernel fusion techniques** that reduce memory bandwidth bottlenecks
-5. **Advanced memory management** strategies for multi-sequence batched serving
+Hardware: 2× RTX 2000 Ada (RunPod), model: Qwen/Qwen2.5-1.5B-Instruct (INT4 NF4).
 
-Each phase includes:
-- ✅ Clean reference implementations
-- ✅ Benchmarking code with time/memory profiling
-- ✅ Comparative visualizations (speedup curves, memory usage)
-- ✅ Detailed explanations of when and why each technique matters
+The key optimization step was increasing `MAX_BATCH_SIZE` from 8 to 64 and the concurrent user count from 20 to 100, which kept the GPU continuously fed and pushed throughput 3.2× higher while also cutting P95 latency by 61%.
 
----
-
-## 📊 Sample Results
-
-**Phase 1 (KV Cache):** 400 tokens → 2.5s (cached) vs. 25.3s (naive) = **10.1x speedup**
-
-**Phase 3 (Sliding Window):** 2048 tokens → 512 MB (full) vs. 32 MB (w=128) = **16x memory reduction**
-
-**Phase 5 (Paged Attention):** 5 variable-length sequences → 4.2 MB (paged pool) vs. 16.8 MB (naive pre-alloc) = **4x savings**
+For the full analysis — including why GPU SM utilization stays at ~30% even at peak throughput, the batch engine architecture, and the LLM-as-a-judge quality evaluation — see [`llm-qwen-deployment/README.md`](llm-qwen-deployment/README.md).
 
 ---
 
-## 🚀 Getting Started
+## What's Next
+
+The current server uses a static batch window: collect requests for up to `BATCH_TIMEOUT` seconds, then fire a fixed batch. The next step is replacing this with a **custom token-level scheduler** that evicts completed sequences mid-batch and immediately admits new ones — the core mechanism behind continuous batching. This requires stepping outside `model.generate()` and running the decode loop manually, one step at a time, with direct control over the KV cache.
+
+---
+
+## Sample Benchmark Results (Notebook)
+
+| Phase | Result |
+|---|---|
+| Phase 1 (KV Cache) | 400 tokens: 2.5 s cached vs. 25.3 s naive — **10.1× speedup** |
+| Phase 3 (Sliding Window) | 2048 tokens: 32 MB (w=128) vs. 512 MB (full) — **16× memory reduction** |
+| Phase 5 (Paged Attention) | 5 variable-length sequences: 4.2 MB paged vs. 16.8 MB naive — **4× savings** |
+| Phase 7 (Deployment) | 2 pods, 1 hour: **13,041 requests served** at median 27.6 s latency |
+
+---
+
+## Getting Started
 
 ```bash
-# Clone the repository
 git clone <repo-url>
 cd LLM-Inference-Optimisation
 
-# Install dependencies
+# Notebook (phases 1–6)
 pip install torch torchvision transformers matplotlib
-
-# Launch Jupyter
 jupyter notebook LLM_inference_from_scratch.ipynb
+
+# Deployment project (phase 7)
+cd llm-qwen-deployment
+pip install -r requirements.txt
+cp .env.example .env   # fill in pod URLs
 ```
 
-**GPU Recommended:** While the code will run on CPU, performance benefits are only observable with CUDA-enabled GPUs.
-
----
+**GPU recommended:** Performance benefits are only observable with a CUDA-enabled GPU.
