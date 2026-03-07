@@ -125,7 +125,7 @@ def _load_model() -> None:
     _model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         quantization_config=quant_cfg,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         attn_implementation="sdpa",
         device_map="auto",
         trust_remote_code=True,

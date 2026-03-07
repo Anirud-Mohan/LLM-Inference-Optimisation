@@ -1,12 +1,12 @@
 # Qwen Moral Story Serving Pipeline
 
-High-throughput inference deployment for a children's moral story generation service using `Qwen/Qwen2.5-1.5B-Instruct`. The goal is to serve as many queries as possible within one hour on commodity GPU hardware, using a custom-built serving stack built from scratch in Python.
+High-throughput inference deployment for a sample use case such as a small children's moral story generation service using `Qwen/Qwen2.5-1.5B-Instruct`. The goal is to serve as many queries as possible within one hour on commodity GPU hardware, using a custom-built serving stack built from scratch in Python.
 
 ---
 
 ## Goal
 
-Extend the optimizations explored in `LLM_inference_from_scratch.ipynb` — KV caching, dynamic batching, INT4 quantization — into a production-grade serving pipeline and quantify how much throughput can be extracted from a small LLM on a single-class GPU without any inference framework.
+Extend the optimizations explored in `LLM_inference_from_scratch.ipynb` KV caching, dynamic batching, INT4 quantization into a production grade serving pipeline and quantify how much throughput can be extracted from a small LLM on a single-class GPU without any inference framework.
 
 **Target: >10,000 requests served within one hour.**
 
@@ -73,7 +73,7 @@ This amortises the fixed cost of loading model weights across N sequences per de
 
 ## Why Batching Over Speculative Decoding
 
-During development we attempted to combine speculative decoding with batching to maximise both per-token speed and GPU utilisation. Three independent obstacles made this impractical:
+During development I attempted to combine speculative decoding with batching to maximise both per-token speed and GPU utilisation. Three independent obstacles made this impractical:
 
 ### 1. The Ragged Tensor Problem
 
@@ -164,64 +164,24 @@ On 2 pods serving thousands of queries, **GPU utilisation matters more than per-
 
 ### Production Run 2 — Optimized (BS=64, 100 users, 1 hour)
 
-**Config:** `MAX_BATCH_SIZE=64`, `BATCH_TIMEOUT=0.1s`, 100 Locust users, 2 pods, 1 hour
+**Config:** `MAX_BATCH_SIZE=64`, `BATCH_TIMEOUT=0.1s`, 100 Locust users, 2× RTX 2000 Ada pods, 1 hour
 
 | Metric | Result |
 |---|---|
-| Total requests served | 13,053 |
-| Successful | **12,983 (99.46%)** |
-| Throughput | **13,041 req/hr** ✓ 130% of target |
-| Median (P50) latency | 27.6 s |
-| P75 latency | 28.6 s |
-| P95 latency | 29.6 s |
-| P99 latency | 30.4 s |
-| Median tokens/sec | 7.5 |
+| Total requests served | 13,522 |
+| Successful | **13,513 (99.93%)** |
+| Throughput | **13,558 req/hr** ✓ 136% of target |
+| Median (P50) latency | 24.9 s |
+| P90 latency | 29.6 s |
+| P95 latency | 30.0 s |
+| P99 latency | 30.8 s |
+| Median tokens/sec | 7.9 |
 | Per-pod split | 50% / 50% (exact round-robin) |
+| Failures | 9 (0.07%) — HTTP 404/502 |
 
-**Result: 13,041 requests served in one hour, exceeding the 10,000 target by 30%.**
+**Result: 13,558 requests served in one hour, exceeding the 10,000 target by 36%.**
 
-Compared to Production Run 1:
-
-| Metric | Run 1 (BS=8, 20u) | Run 2 (BS=64, 100u) | Change |
-|---|---|---|---|
-| Throughput | 4,090 req/hr | **13,041 req/hr** | **+3.2×** |
-| Median latency | 37.6 s | 27.6 s | −27% |
-| P95 latency | 75.9 s | 29.6 s | **−61%** |
-| P99 latency | 82.2 s | 30.4 s | **−63%** |
-| Failure rate | 0.17% | 0.54% | within acceptable range |
-
-The latency distribution in Run 2 is extremely tight — P50 through P99 span only 2.8 s — because the queue is always deep enough to fire full batches without head-of-line blocking.
-
----
-
-### GPU Utilization — Why ~30% is the Expected Ceiling
-
-Both runs reported approximately 30% GPU SM utilization on the RTX 2000 Ada. This is not inefficiency — it is the memory-bandwidth ceiling for a 1.5 B-parameter INT4 model.
-
-**How the GPU is actually behaving in Run 2:**
-
-Each pod fires a new batch immediately after the previous one completes (inter-batch gap ≈ 15 s, inferred from per-pod timestamp clustering). The GPU has no idle time between batches — it is continuously running inference.
-
-**Why SM utilization is still 30%:**
-
-`nvidia-smi GPU%` reports **SM (shader/tensor core) occupancy**, not overall GPU busyness. For small INT4 models, the bottleneck is VRAM bandwidth, not compute:
-
-```
-Model weights (INT4): ~750 MB
-RTX 2000 Ada VRAM bandwidth: ~288 GB/s
-
-Time to load all weights for one decode step:
-  750 MB / 288 GB/s ≈ 2.6 ms
-
-The tensor cores complete the matrix multiply in < 1 ms,
-then sit idle waiting for the next chunk of weights from VRAM.
-→ SM utilization: ~30%
-→ Memory controller utilization: ~80–90%
-```
-
-**The proof:** throughput tripled (4,090 → 13,041 req/hr) while GPU SM% remained at ~30%. If the system were compute-limited, increasing batch size would have driven SM utilization up proportionally. It did not — the memory controller is the true bottleneck, and the SM cores race ahead regardless of batch size.
-
-For a 1.5 B-parameter model on modern GPU hardware, 30% SM utilization is the ceiling, not a sign of waste. Saturating SM cores would require a model roughly 4–10× larger.
+The latency distribution is tight — P50 through P99 span about 6 s — because the queue stays deep enough to fire full batches without head-of-line blocking. **Both GPUs’ utilization remained constantly above 90%** throughout the run, confirming that the batch engine keeps the hardware saturated.
 
 ---
 
@@ -298,11 +258,11 @@ llm-qwen-deployment/
 ├── requirements.txt       # Dependencies
 ├── .env.example           # Environment variable template
 └── results/
-    ├── request_metrics_custom_2pod_1h.csv    # Production Run 1 per-request metrics
-    ├── request_metrics_custom_2pod_bs64.csv  # Production Run 2 per-request metrics
-    ├── locust_custom_2pod_1h_stats.csv       # Locust aggregate stats (Run 1)
-    ├── locust_custom_2pod_bs64_stats.csv     # Locust aggregate stats (Run 2)
-    └── eval_results.json                     # LLM-as-a-judge scores (30 prompts)
+    ├── request_metrics_custom_2pod_1h.csv           # Production Run 1 per-request metrics
+    ├── request_metrics_rtx_2000_ada_2pod_bs64.csv   # Production Run 2 per-request metrics (RTX 2000 Ada)
+    ├── locust_custom_2pod_1h_stats.csv             # Locust aggregate stats (Run 1)
+    ├── locust_custom_2pod_rtx_2000_ada_bs64_stats.csv  # Locust aggregate stats (Run 2)
+    └── eval_results.json                            # LLM-as-a-judge scores (30 prompts)
 ```
 
 ---
