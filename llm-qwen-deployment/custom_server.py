@@ -1,34 +1,51 @@
 """
-Custom LLM serving server — Dynamic Batching with async request queue.
+Dynamic Batching LLM Server
+============================
+High-throughput inference for Qwen2.5-1.5B-Instruct via request batching.
 
-Optimisation demonstrated:
-  - Incoming requests are queued instead of being processed one-by-one.
-  - A background engine drains the queue in batches (up to MAX_BATCH_SIZE).
-  - A single model.generate() call processes the whole batch on the GPU at once,
-    giving dramatically better GPU utilisation than naive single-request serving.
+Architecture
+------------
+  Incoming HTTP requests are queued instead of being processed one-by-one.
+  A background engine thread drains the queue in batches (up to MAX_BATCH_SIZE)
+  and runs a single model.generate() call for the entire batch on the GPU,
+  amortising matrix multiplications across N sequences.
 
-This is analogous to vLLM's continuous batching at a simpler level: we show that
-batching alone yields significant throughput gains before any exotic optimisation.
+  asyncio.Queue (FastAPI) ──relay──▶ threading.Queue (bridge)
+                                         │
+                               engine thread drains batch
+                                         │
+                              model.generate(**padded_batch)
+                                         │
+                              futures resolved ◀─── results routed back
+
+Extends LLM_inference_from_scratch.ipynb phases 1 (KV cache), 2 (batching),
+and 7 (INT4 quantization).
+
+See README.md § "Why Batching Over Speculative Decoding" for the rationale
+behind choosing batching over speculative decoding for this deployment.
 """
 
 import asyncio
 import csv
+import logging
 import os
-import queue as tqueue
 import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from queue import Empty, Queue
 
 import torch
-import uvicorn
+import torch.nn as nn
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import uvicorn
 
-import torch.nn as nn
-# torch 2.10 is missing nn.Module.set_submodule — patch it in.
+# ── Compatibility patch ───────────────────────────────────────────────────────
+# Some torch builds (e.g. 2.10) are missing nn.Module.set_submodule, which
+# transformers calls during BitsAndBytes INT4 weight replacement.
 if not hasattr(nn.Module, "set_submodule"):
     def _set_submodule(self, target: str, module: nn.Module) -> None:
         parts = target.split(".")
@@ -39,20 +56,24 @@ if not hasattr(nn.Module, "set_submodule"):
     nn.Module.set_submodule = _set_submodule
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-MAIN_MODEL_ID  = os.getenv("MAIN_MODEL_ID",  "Qwen/Qwen2.5-1.5B-Instruct")
+MODEL_ID       = os.getenv("MODEL_ID", "Qwen/Qwen2.5-1.5B-Instruct")
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "8"))
-MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "200"))
-BATCH_TIMEOUT  = float(os.getenv("BATCH_TIMEOUT", "0.05"))   # seconds to wait to fill a batch
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "256"))
+BATCH_TIMEOUT  = float(os.getenv("BATCH_TIMEOUT", "0.05"))
 PORT           = int(os.getenv("PORT", "8888"))
 METRICS_FILE   = os.getenv("METRICS_FILE", "/root/request_metrics.csv")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+log = logging.getLogger("batch_server")
+
 # ── Globals ───────────────────────────────────────────────────────────────────
 _tokenizer = None
 _model     = None
 
-# ── Pending-request descriptor ────────────────────────────────────────────────
+
+# ── Request descriptor ────────────────────────────────────────────────────────
 @dataclass
 class _Request:
     messages:   list[dict]
@@ -63,13 +84,14 @@ class _Request:
 
 
 # ── Queues ────────────────────────────────────────────────────────────────────
-_async_queue: asyncio.Queue = None  # asyncio side  (set in lifespan)
-_bridge:      tqueue.Queue  = tqueue.Queue()  # thread-safe bridge to engine
+_async_queue: asyncio.Queue | None = None
+_bridge: Queue = Queue()
 
 
 # ── Metrics writer ────────────────────────────────────────────────────────────
 _metrics_lock  = threading.Lock()
 _metrics_first = True
+
 
 def _write_metric(row: dict) -> None:
     global _metrics_first
@@ -87,13 +109,13 @@ def _write_metric(row: dict) -> None:
 def _load_model() -> None:
     global _tokenizer, _model
 
-    print(f"[Server] Loading tokenizer from {MAIN_MODEL_ID} ...")
-    _tokenizer = AutoTokenizer.from_pretrained(MAIN_MODEL_ID, trust_remote_code=True)
+    log.info("Loading tokenizer from %s …", MODEL_ID)
+    _tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
     if _tokenizer.pad_token is None:
         _tokenizer.pad_token = _tokenizer.eos_token
-    _tokenizer.padding_side = "left"   # causal LM needs left-padding for batches
+    _tokenizer.padding_side = "left"
 
-    print(f"[Server] Loading model (INT4 NF4, sdpa) ...")
+    log.info("Loading model %s (INT4 NF4, SDPA) …", MODEL_ID)
     quant_cfg = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -101,7 +123,7 @@ def _load_model() -> None:
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
     _model = AutoModelForCausalLM.from_pretrained(
-        MAIN_MODEL_ID,
+        MODEL_ID,
         quantization_config=quant_cfg,
         torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
@@ -109,12 +131,23 @@ def _load_model() -> None:
         trust_remote_code=True,
     )
     _model.eval()
-    print(f"[Server] Model ready on {DEVICE}.")
+
+    n_params = sum(p.numel() for p in _model.parameters()) / 1e6
+    log.info("Model ready on %s — %.0fM params", DEVICE, n_params)
+
+    # Warmup: run one dummy forward pass so CUDA kernels are compiled and cached
+    # before the first real request arrives. Skips this cost from request latency.
+    log.info("Running warmup pass …")
+    with torch.no_grad():
+        dummy = _tokenizer("warmup", return_tensors="pt").to(DEVICE)
+        _model.generate(**dummy, max_new_tokens=4, do_sample=False, pad_token_id=_tokenizer.pad_token_id)
+    log.info("Warmup done — server ready to serve requests.")
 
 
 # ── Batch inference ───────────────────────────────────────────────────────────
+@torch.no_grad()
 def _run_batch(batch: list[_Request]) -> None:
-    """Run one model.generate() call for a whole batch, resolve each future."""
+    """Run a single model.generate() call for the whole batch."""
     assert _tokenizer and _model
 
     prompts = [
@@ -134,14 +167,13 @@ def _run_batch(batch: list[_Request]) -> None:
     ).to(DEVICE)
 
     t0 = time.perf_counter()
-    with torch.no_grad():
-        out_ids = _model.generate(
-            **enc,
-            max_new_tokens=max_new,
-            do_sample=False,
-            pad_token_id=_tokenizer.pad_token_id,
-        )
-    latency = time.perf_counter() - t0
+    out_ids = _model.generate(
+        **enc,
+        max_new_tokens=max_new,
+        do_sample=False,
+        pad_token_id=_tokenizer.pad_token_id,
+    )
+    inference_s = time.perf_counter() - t0
 
     prompt_len = enc["input_ids"].shape[1]
     now = time.perf_counter()
@@ -149,27 +181,26 @@ def _run_batch(batch: list[_Request]) -> None:
     for i, req in enumerate(batch):
         new_ids = out_ids[i, prompt_len:]
         text    = _tokenizer.decode(new_ids, skip_special_tokens=True)
+        n_comp  = int((new_ids != _tokenizer.pad_token_id).sum())
 
         result = {
             "text":              text,
             "prompt_tokens":     prompt_len,
-            "completion_tokens": int(new_ids.shape[0]),
+            "completion_tokens": n_comp,
             "batch_size":        len(batch),
-            "inference_s":       round(latency, 4),
+            "inference_s":       round(inference_s, 4),
         }
 
-        # Metrics row (written from engine thread — that's fine, lock protects it)
         _write_metric({
             "timestamp":         round(now, 3),
             "queue_wait_s":      round(t0 - req.t_arrived, 4),
-            "inference_s":       round(latency, 4),
+            "inference_s":       round(inference_s, 4),
             "total_s":           round(now - req.t_arrived, 4),
             "prompt_tokens":     prompt_len,
-            "completion_tokens": int(new_ids.shape[0]),
+            "completion_tokens": n_comp,
             "batch_size":        len(batch),
         })
 
-        # Resolve the asyncio future from the engine thread
         req.loop.call_soon_threadsafe(
             lambda r=req, res=result: (
                 None if r.future.done() else r.future.set_result(res)
@@ -179,17 +210,17 @@ def _run_batch(batch: list[_Request]) -> None:
 
 # ── Batch engine (background thread) ─────────────────────────────────────────
 def _engine_loop() -> None:
-    """Continuously drain _bridge in batches."""
+    """Continuously drain _bridge in batches of up to MAX_BATCH_SIZE."""
+    log.info("Engine loop started — max_batch=%d  timeout=%.3fs", MAX_BATCH_SIZE, BATCH_TIMEOUT)
+
     while True:
         batch: list[_Request] = []
 
-        # Block until at least one request arrives
         try:
             batch.append(_bridge.get(timeout=1.0))
-        except tqueue.Empty:
+        except Empty:
             continue
 
-        # Collect more requests up to MAX_BATCH_SIZE within BATCH_TIMEOUT
         deadline = time.perf_counter() + BATCH_TIMEOUT
         while len(batch) < MAX_BATCH_SIZE:
             remaining = deadline - time.perf_counter()
@@ -197,7 +228,7 @@ def _engine_loop() -> None:
                 break
             try:
                 batch.append(_bridge.get(timeout=remaining))
-            except tqueue.Empty:
+            except Empty:
                 break
 
         try:
@@ -218,7 +249,7 @@ async def _relay_loop() -> None:
         _bridge.put(req)
 
 
-# ── FastAPI app ───────────────────────────────────────────────────────────────
+# ── FastAPI application ───────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _async_queue
@@ -226,10 +257,11 @@ async def lifespan(app: FastAPI):
     _async_queue = asyncio.Queue()
     threading.Thread(target=_engine_loop, daemon=True, name="engine").start()
     asyncio.create_task(_relay_loop())
+    log.info("Server ready — max_batch=%d  port=%d", MAX_BATCH_SIZE, PORT)
     yield
 
 
-app = FastAPI(title="Custom LLM Server", lifespan=lifespan)
+app = FastAPI(title="Dynamic Batching LLM Server", lifespan=lifespan)
 
 
 class _Message(BaseModel):
@@ -244,7 +276,13 @@ class _ChatRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": MAIN_MODEL_ID, "batch_size": MAX_BATCH_SIZE}
+    return {
+        "status":      "ok",
+        "model":       MODEL_ID,
+        "batch_size":  MAX_BATCH_SIZE,
+        "device":      DEVICE,
+        "queue_depth": _bridge.qsize(),
+    }
 
 
 @app.post("/v1/chat/completions")
@@ -265,7 +303,10 @@ async def chat_completions(req: _ChatRequest):
         return JSONResponse(status_code=504, content={"error": "request timed out"})
 
     return {
+        "id": f"chatcmpl-batch",
+        "object": "chat.completion",
         "choices": [{
+            "index": 0,
             "message": {"role": "assistant", "content": result["text"]},
             "finish_reason": "stop",
         }],
@@ -274,11 +315,12 @@ async def chat_completions(req: _ChatRequest):
             "completion_tokens": result["completion_tokens"],
         },
         "custom": {
-            "batch_size":    result["batch_size"],
-            "inference_s":   result["inference_s"],
+            "batch_size":  result["batch_size"],
+            "inference_s": result["inference_s"],
         },
     }
 
 
+# ───────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")

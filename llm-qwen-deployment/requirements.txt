@@ -5,3 +5,4 @@ openai
 requests
 locust
 python-dotenv
+pydantic>=2.0

@@ -28,8 +28,10 @@ Columns: timestamp, pod_url, success, response_time_ms, completion_tokens, token
 """
 
 import csv
+import itertools
 import os
 import random
+import threading
 import time
 from pathlib import Path
 
@@ -53,6 +55,11 @@ if not POD_URLS:
         "Set POD_1_URL (and optionally POD_2_URL) in your .env file "
         "or as environment variables."
     )
+
+# Round-robin pod selection — guarantees exactly even request distribution
+# regardless of random chance, preventing one pod from saturating while the other idles.
+_pod_cycle = itertools.cycle(range(len(POD_URLS)))
+_pod_lock  = threading.Lock()
 
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-1.5B-Instruct")
 RUN_TAG    = os.getenv("RUN_TAG", "run").strip()
@@ -94,12 +101,13 @@ class StoryUser(HttpUser):
 
     @task
     def generate_story(self):
-        pod_url = random.choice(POD_URLS)
+        with _pod_lock:
+            pod_url = POD_URLS[next(_pod_cycle)]
         prompt  = random.choice(PROMPTS)
         payload = {
             "model": MODEL_NAME,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 350,
+            "max_tokens": 256,
             "temperature": 0,
         }
         url = f"{pod_url.rstrip('/')}/v1/chat/completions"
