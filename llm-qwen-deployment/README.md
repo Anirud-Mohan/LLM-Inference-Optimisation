@@ -34,7 +34,7 @@ Locust (100 users, local machine)
          (per-request latency, tokens/sec)
 ```
 
-Both pods serve independently — this is **data parallelism**: each pod holds a full model copy and handles independent requests. Locust distributes traffic in a strict round-robin across both pod URLs, guaranteeing an exact 50/50 split.
+Both pods serve independently this is **data parallelism**: each pod holds a full model copy and handles independent requests. Locust distributes traffic in a strict round-robin across both pod URLs, guaranteeing an exact 50/50 split.
 
 ---
 
@@ -108,7 +108,7 @@ On 2 pods serving thousands of queries, **GPU utilisation matters more than per-
 
 ## Experimental Results
 
-### Smoke Test 1 — Speculative Decoding (batch=1)
+### Smoke Test 1 : Speculative Decoding (batch=1)
 
 **Config:** `MAX_BATCH_SIZE=1`, `assistant_model=Qwen2.5-0.5B-Instruct`, 10 Locust users, single pod
 
@@ -124,7 +124,7 @@ On 2 pods serving thousands of queries, **GPU utilisation matters more than per-
 
 ---
 
-### Smoke Test 2 — Dynamic Batching (BS=8)
+### Smoke Test 2 : Dynamic Batching (BS=8)
 
 **Config:** `MAX_BATCH_SIZE=8`, speculative decoding disabled, 10 Locust users, single pod
 
@@ -144,7 +144,7 @@ On 2 pods serving thousands of queries, **GPU utilisation matters more than per-
 
 ---
 
-### Production Run 1 — Scaling Baseline (BS=8, 20 users, 1 hour)
+### Production Run 1 : Scaling Baseline (BS=8, 20 users, 1 hour)
 
 **Config:** `MAX_BATCH_SIZE=8`, 20 Locust users, 2 pods, 1 hour
 
@@ -162,7 +162,7 @@ On 2 pods serving thousands of queries, **GPU utilisation matters more than per-
 
 ---
 
-### Production Run 2 — Optimized (BS=64, 100 users, 1 hour)
+### Production Run 2 : Optimized (BS=64, 100 users, 1 hour)
 
 **Config:** `MAX_BATCH_SIZE=64`, `BATCH_TIMEOUT=0.1s`, 100 Locust users, 2× RTX 2000 Ada pods, 1 hour
 
@@ -199,7 +199,7 @@ To verify that throughput gains did not come at the cost of output quality, 30 h
 
 **Observations:**
 
-- Age-appropriateness (0.97) and relevance (0.94) are consistently strong — the model reliably generates on-topic, child-friendly content.
+- Age-appropriateness (0.97) and relevance (0.94) are consistently strong, the model reliably generates on-topic, child-friendly content.
 - Narrative coherence (0.72) is the primary weakness. The judge frequently noted abrupt endings, which is an artifact of the model hitting `max_tokens=350` mid-sentence. Increasing the token budget or post-processing to trim at a sentence boundary would raise this score.
 - Moral clarity (0.85) is solid but occasionally suffers when the model states the moral didactically rather than demonstrating it through the narrative.
 
