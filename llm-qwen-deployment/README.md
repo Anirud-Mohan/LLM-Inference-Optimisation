@@ -45,7 +45,7 @@ Built from scratch, extending the notebook experiments. Served via FastAPI + uvi
 | Optimization | Implementation |
 |---|---|
 | **Dynamic batching** | Async request queue (`asyncio.Queue`) feeds a background engine thread that drains up to `MAX_BATCH_SIZE` requests and runs a single `model.generate()` call for the entire batch. GPU matrix multiplications are amortised across N sequences. |
-| INT4 NF4 Quantization | `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)` — reduces model to ~750 MB VRAM |
+| INT4 NF4 Quantization | `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)` reduces model to ~750 MB VRAM |
 | Flash Attention (SDPA) | `attn_implementation="sdpa"` |
 | Warmup pass | One dummy forward pass on startup to pre-compile CUDA kernels before the first real request |
 | Per-request metrics | CSV log with `queue_wait_s`, `inference_s`, `total_s`, `prompt_tokens`, `completion_tokens`, `batch_size` |
@@ -115,12 +115,12 @@ On 2 pods serving thousands of queries, **GPU utilisation matters more than per-
 | Metric | Result |
 |---|---|
 | Total requests | 104 |
-| Failed requests | 2 (1.92%) — ReadTimeout after 120 s |
+| Failed requests | 2 (1.92%) —> ReadTimeout after 120 s |
 | Avg response time | ~99,550 ms (~100 s) |
 | Median (P50) latency | ~102,000 ms |
 | Throughput | 0.09 req/s |
 
-**Verdict:** Unusably slow. With `batch_size=1` enforced by speculative decoding, each of the 10 concurrent users had to wait for all previous requests to complete — requests queued serially. GPU was barely utilised.
+**Verdict:** Unusably slow. With `batch_size=1` enforced by speculative decoding, each of the 10 concurrent users had to wait for all previous requests to complete, requests queued serially. GPU was barely utilised.
 
 ---
 
@@ -177,11 +177,11 @@ On 2 pods serving thousands of queries, **GPU utilisation matters more than per-
 | P99 latency | 30.8 s |
 | Median tokens/sec | 7.9 |
 | Per-pod split | 50% / 50% (exact round-robin) |
-| Failures | 9 (0.07%) — HTTP 404/502 |
+| Failures | 9 (0.07%) —> HTTP 404/502 |
 
 **Result: 13,558 requests served in one hour, exceeding the 10,000 target by 36%.**
 
-The latency distribution is tight — P50 through P99 span about 6 s — because the queue stays deep enough to fire full batches without head-of-line blocking. **Both GPUs’ utilization remained constantly above 90%** throughout the run, confirming that the batch engine keeps the hardware saturated.
+The latency distribution is tight where P50 through P99 span about 6 s only because the queue stays deep enough to fire full batches without head-of-line blocking. **Both GPUs’ utilization remained constantly above 90%** throughout the run, confirming that the batch engine keeps the hardware saturated.
 
 ---
 
@@ -211,8 +211,8 @@ This deployment uses **Data Parallelism (DP)**: each pod holds a complete copy o
 
 Alternative strategies (not implemented here):
 
-- **Tensor Parallelism (TP)**: splits individual weight matrices across multiple GPUs on the same machine — reduces per-GPU memory, enables larger models.
-- **Pipeline Parallelism (PP)**: assigns different transformer layers to different GPUs — useful for very deep models that don't fit in a single GPU's memory.
+- **Tensor Parallelism (TP)**: splits individual weight matrices across multiple GPUs on the same machine which reduces per-GPU memory, enables larger models.
+- **Pipeline Parallelism (PP)**: assigns different transformer layers to different GPUs, useful for very deep models that don't fit in a single GPU's memory.
 
 For a 1.5 B-parameter model on 20 GB VRAM, DP across 2 pods is the right strategy: the model fits comfortably on one GPU, so parallelizing the workload (not the model) is optimal.
 
@@ -222,7 +222,7 @@ For a 1.5 B-parameter model on 20 GB VRAM, DP across 2 pods is the right strateg
 
 ### Custom Request Scheduler (Continuous Batching)
 
-The current batch engine uses a static window: it collects requests for up to `BATCH_TIMEOUT` seconds, then fires a fixed batch. This means sequences that finish early hold up the batch until all sequences complete — a form of head-of-line blocking at the batch level.
+The current batch engine uses a static window: it collects requests for up to `BATCH_TIMEOUT` seconds, then fires a fixed batch. This means sequences that finish early hold up the batch until all sequences complete which is a form of head-of-line blocking at the batch level.
 
 The next step is to replace this with a **custom token-level scheduler** that:
 
@@ -230,7 +230,7 @@ The next step is to replace this with a **custom token-level scheduler** that:
 2. After each decode step, evicts sequences that have generated their `<eos>` token and immediately admits new sequences from the waiting queue into the freed KV-cache slots.
 3. Runs the forward pass over a dynamically sized, always-full set of active sequences.
 
-This is the architectural mechanism behind continuous batching — the core scheduling innovation that allows production-grade inference systems to avoid head-of-line blocking entirely. Implementing it requires stepping outside `model.generate()` and running the decode loop manually, one token at a time, with full control over the KV cache.
+This is the architectural mechanism behind continuous batching, the core scheduling innovation that allows production-grade inference systems to avoid head-of-line blocking entirely. Implementing it requires stepping outside `model.generate()` and running the decode loop manually, one token at a time, with full control over the KV cache.
 
 The primary engineering challenges:
 
@@ -238,7 +238,7 @@ The primary engineering challenges:
 - **Sequence lifecycle management**: track which positions in the batch tensor belong to which request, and handle variable-length eviction and admission without reordering the entire batch.
 - **Padding-free computation** (stretch goal): pack sequences without padding using custom attention masks or block-sparse kernels to eliminate computation on padding tokens.
 
-This is the implementation path toward the kind of throughput efficiency that purpose-built inference engines achieve through their schedulers — and it is the natural next phase of this project.
+This is the implementation path toward the kind of throughput efficiency that purpose-built inference engines achieve through their schedulers and it is the natural next phase of this project.
 
 ### PagedAttention-Style KV Memory
 

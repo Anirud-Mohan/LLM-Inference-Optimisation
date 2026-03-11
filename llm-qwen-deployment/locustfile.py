@@ -1,26 +1,6 @@
 """Load test for the Qwen moral story endpoint.
 
-Works for both pipelines — set RUN_TAG to distinguish output files:
-
-    # Custom pipeline (2 pods):
-    RUN_TAG=custom \
-    POD_1_URL=https://<POD1>-8000.proxy.runpod.net \
-    POD_2_URL=https://<POD2>-8000.proxy.runpod.net \
-    locust -f locustfile.py --headless \
-        --users 100 --spawn-rate 10 \
-        --run-time 2h \
-        --host $POD_1_URL \
-        --csv results/locust_custom
-
-    # vLLM pipeline (2 pods):
-    RUN_TAG=vllm \
-    POD_1_URL=https://<POD1>-8000.proxy.runpod.net \
-    POD_2_URL=https://<POD2>-8000.proxy.runpod.net \
-    locust -f locustfile.py --headless \
-        --users 100 --spawn-rate 10 \
-        --run-time 2h \
-        --host $POD_1_URL \
-        --csv results/locust_vllm
+Works for both pipelines — set RUN_TAG to distinguish output files
 
 Per-request metrics are written to:
     results/request_metrics_<RUN_TAG>.csv
@@ -57,7 +37,6 @@ if not POD_URLS:
     )
 
 # Round-robin pod selection — guarantees exactly even request distribution
-# regardless of random chance, preventing one pod from saturating while the other idles.
 _pod_cycle = itertools.cycle(range(len(POD_URLS)))
 _pod_lock  = threading.Lock()
 

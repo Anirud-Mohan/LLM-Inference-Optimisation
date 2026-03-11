@@ -61,9 +61,6 @@ def generate_story(prompt: str) -> str:
 
 
 def judge_story(prompt: str, story: str) -> dict:
-    # gpt-5-mini is a reasoning model: it consumes tokens internally for reasoning
-    # before producing output. max_completion_tokens covers reasoning + output combined.
-    # Setting it too low (e.g. 300) leaves 0 tokens for actual output → empty content.
     response = judge_client.chat.completions.create(
         model=JUDGE_MODEL,
         messages=[{"role": "user", "content": JUDGE_PROMPT.format(prompt=prompt, story=story)}],

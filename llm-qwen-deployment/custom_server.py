@@ -1,30 +1,3 @@
-"""
-Dynamic Batching LLM Server
-============================
-High-throughput inference for Qwen2.5-1.5B-Instruct via request batching.
-
-Architecture
-------------
-  Incoming HTTP requests are queued instead of being processed one-by-one.
-  A background engine thread drains the queue in batches (up to MAX_BATCH_SIZE)
-  and runs a single model.generate() call for the entire batch on the GPU,
-  amortising matrix multiplications across N sequences.
-
-  asyncio.Queue (FastAPI) ──relay──▶ threading.Queue (bridge)
-                                         │
-                               engine thread drains batch
-                                         │
-                              model.generate(**padded_batch)
-                                         │
-                              futures resolved ◀─── results routed back
-
-Extends LLM_inference_from_scratch.ipynb phases 1 (KV cache), 2 (batching),
-and 7 (INT4 quantization).
-
-See README.md § "Why Batching Over Speculative Decoding" for the rationale
-behind choosing batching over speculative decoding for this deployment.
-"""
-
 import asyncio
 import csv
 import logging
